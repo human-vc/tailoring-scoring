@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 import pandas as pd, numpy as np, re, time
 from vllm import LLM, SamplingParams
 
