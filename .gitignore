@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+data/e_full_scores.parquet
+.venv/
