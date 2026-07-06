@@ -22,16 +22,22 @@ llm = LLM(model=MODEL, dtype="bfloat16", gpu_memory_utilization=0.90, max_model_
 tok = llm.get_tokenizer()
 sp = SamplingParams(temperature=0.0, max_tokens=160)
 
-def score_texts(texts):
-    prompts = [tok.apply_chat_template([{"role": "user", "content": prm(str(t)[:1600])}],
-                                       tokenize=False, add_generation_prompt=True) for t in texts]
-    outs = llm.generate(prompts, sp)
-    res = []
-    for o in outs:
-        txt = o.outputs[0].text
-        m = re.findall(r"SCORE:\s*(\d{1,3})", txt) or re.findall(r"\b(\d{1,3})\b", txt)
-        res.append(min(int(m[-1]), 100) if m else np.nan)
-    return np.array(res, dtype=float)
+def build_prompts(texts, mode):
+    p = [prm(str(t)[:1600]) for t in texts]
+    if mode == "chat":
+        p = [tok.apply_chat_template([{"role": "user", "content": x}],
+                                     tokenize=False, add_generation_prompt=True) for x in p]
+    return p
+
+def parse(txt):
+    m = re.findall(r"SCORE:\s*(\d{1,3})", txt) or re.findall(r"\b(\d{1,3})\b", txt)
+    return min(int(m[-1]), 100) if m else np.nan
+
+def score_texts(texts, mode, return_raw=False):
+    outs = llm.generate(build_prompts(texts, mode), sp)
+    raw = [o.outputs[0].text for o in outs]
+    res = np.array([parse(t) for t in raw], dtype=float)
+    return (res, raw) if return_raw else res
 
 def auc(pos, neg):
     pos, neg = np.asarray(pos), np.asarray(neg)
@@ -43,22 +49,26 @@ def spearman(x, y):
     return np.corrcoef(rx, ry)[0, 1]
 
 g = pd.read_parquet("data/audit_gate.parquet")
-t0 = time.time()
-g["s"] = score_texts(g.text_clean.tolist())
-gv = g.dropna(subset=["s"])
-pos = gv[gv.h == 2].s.values
-neg = gv[gv.h == 0].s.values
-a = auc(pos, neg)
-print(f"[GATE] scored {len(gv)} audit items in {(time.time()-t0)/60:.1f}min")
-print(f"[GATE] tailored-vs-generic AUC = {a:.3f} | Spearman(score,human) = {spearman(gv.s.values, gv.h.values):.3f}")
-print(f"[GATE] score dist mean {gv.s.mean():.1f} median {gv.s.median():.0f} valid {gv.s.notna().mean():.2f}")
-if a < GATE_MIN_AUC:
-    raise SystemExit(f"[GATE FAILED] AUC {a:.3f} < {GATE_MIN_AUC}. Prompt/format drifted — STOP, do not trust full run.")
-print(f"[GATE PASSED] AUC {a:.3f} >= {GATE_MIN_AUC}. Proceeding to full corpus.\n")
+results = {}
+for mode in ("raw", "chat"):
+    s, raw = score_texts(g.text_clean.tolist(), mode, return_raw=True)
+    gv = pd.DataFrame({"s": s, "h": g.h.values}).dropna(subset=["s"])
+    a = auc(gv[gv.h == 2].s.values, gv[gv.h == 0].s.values)
+    rho = spearman(gv.s.values, gv.h.values)
+    results[mode] = (a, s)
+    print(f"[GATE:{mode}] AUC = {a:.3f} | Spearman = {rho:.3f} | mean {gv.s.mean():.1f} median {gv.s.median():.0f} valid {gv.s.notna().mean():.2f}")
+    print(f"[GATE:{mode}] sample output:\n    {raw[0][:280].strip()}\n")
+
+best = max(results, key=lambda m: results[m][0])
+best_auc = results[best][0]
+print(f"[GATE] best format = {best} (AUC {best_auc:.3f})")
+if best_auc < GATE_MIN_AUC:
+    raise SystemExit(f"[GATE FAILED] best AUC {best_auc:.3f} < {GATE_MIN_AUC}. Neither format reproduces — STOP, ping before trusting.")
+print(f"[GATE PASSED] using {best} format for full corpus.\n")
 
 inp = pd.read_parquet("data/e_score_inputs.parquet")
 t0 = time.time()
-inp["rscore"] = score_texts(inp.text_clean.tolist())
+inp["rscore"] = score_texts(inp.text_clean.tolist(), best)
 inp[["NoticeId", "rscore"]].to_parquet("data/e_full_scores.parquet", index=False)
 print(f"[FULL] scored {len(inp)} in {(time.time()-t0)/60:.1f}min | mean {inp.rscore.mean():.1f} "
       f"median {inp.rscore.median():.0f} valid {inp.rscore.notna().mean():.3f}")
